@@ -20,22 +20,6 @@ socketServer.on("connection", async (ws, request) => {
     const query = url.parse(request.url ?? '', true).query;
     let botId = ""
 
-    const humeSocket = await humeClient.empathicVoice.chat.connect({
-        onOpen: () => {
-          console.log('Hume WebSocket connection opened');
-        },
-        onMessage: (message) => {
-          console.log(message);
-        },
-        onError: (error) => {
-          console.error(error);
-        },
-        onClose: () => {
-          console.log('WebSocket connection closed');
-        },
-
-    });
-
     const rawSocket = new WebSocket("wss://api.hume.ai/v0/evi/chat?api_key=" + process.env.HUME_API_KEY)
     rawSocket.onopen = () => {
         console.log('hume socket opened')
@@ -46,36 +30,25 @@ socketServer.on("connection", async (ws, request) => {
     }
 
     let counter = 0
+    let buffers: Buffer[] = []
       
     ws.on("message", async (data: Buffer, isBinary) => {
         try {
-          console.log("DATA:  ", data)
             if (!isBinary) {
-              console.log(" THOIS SHOULD LOG");
-                console.log("PEEEEEEEE: ", data.toString())
                 const initialMessage = JSON.parse(data.toString())
                 console.log('1st message', initialMessage)
                 botId = initialMessage.bot_id
                 connections.set(ws, { botId })
             } else {
-                fs.writeFileSync("original.raw", data)
-                const dataNew = data.subarray(4)
-                fs.writeFileSync("out.raw", dataNew)
-                
-                const b64 = dataNew.toString("base64")
-                const b64_ = await convertS16LEToWavBase64(dataNew)
-                await humeSocket.sendAudioInput({
-                    data: b64_,
-                    customSessionId: botId
-                })
-                // if (counter < 10) {
-                // rawSocket.send(JSON.stringify({
-                //     data: b64_,
-                //     type: "audio_input"
-                // }))
-                // counter++
-                // console.log('sent', b64_.length)
-                // }
+                const s16le = data
+                buffers.push(data)
+                fs.writeFileSync("original.raw", Buffer.concat(buffers), "binary")
+                const b64 = await convertS16LEToWavBase64(s16le)
+                rawSocket.send(JSON.stringify({
+                    data: b64,
+                    type: "audio_input"
+                }))
+                console.log('sent', b64.length, Date.now() / 1000)
             }
         } catch (err) {
             console.error("error", err)
