@@ -10,6 +10,8 @@ import fastq, { worker } from "fastq";
 import { isBuiltin } from "module";
 //@ts-ignore
 import getMP3Duration from "get-mp3-duration"
+import { connectToDB } from "./mongodb";
+import { ObjectId } from "mongodb";
 
 const socketServer = new WebSocketServer({ port: 3019, path: "/audio-stream", clientTracking: false, maxPayload: 1048576 })
 const humeClient = new HumeClient({
@@ -40,31 +42,17 @@ socketServer.on("connection", async (ws, request) => {
     console.log(`Received audio streaming connection from ${request.socket.remoteAddress}:${request.socket.remotePort}`);
     connections.set(ws, {})
     const query = url.parse(request.url ?? '', true).query;
+    const scenarioId = query.scenarioId as string
+    if (!scenarioId) {
+        ws.close(4000, "Must provide scenarioId.")
+    }
     let botId = ""
+    let humeConfigId = ""
     let queue = fastq.promise(humeAudioPlayer, 1)
 
-    const rawSocket = new WebSocket("wss://api.hume.ai/v0/evi/chat?api_key=" + process.env.HUME_API_KEY)
-    rawSocket.onopen = () => {
-        console.log('hume socket opened')
-    }
+    let rawSocket: WebSocket | undefined
 
-    rawSocket.onmessage = async (e) => {
-        const parsed = JSON.parse(e.data as string)
-        const audio = parsed.data
-        if (typeof audio === "string") {
-            const wav = Buffer.from(audio, "base64")
-            const mp3 = await convertWavToMp3(wav)
-            // fs.writeFileSync(parsed.id + ".mp3", mp3, "binary")
-            queue.push([mp3, botId])
-        } else {
-            console.log('hume response', parsed)
-        }
-    }
-
-    let counter = 0
     let buffers: Buffer[] = []
-
-    let writes = 0
       
     ws.on("message", async (data: Buffer, isBinary) => {
         try {
@@ -73,6 +61,34 @@ socketServer.on("connection", async (ws, request) => {
                 console.log('recall.ai init', initialMessage)
                 botId = initialMessage.bot_id
                 connections.set(ws, { botId })
+                if (!rawSocket) {
+                    const mongoClient = await connectToDB()
+                    const database = mongoClient.db("HopeDB");
+                    const sessions = database.collection("Sessions");
+                    const scenarios = database.collection("Scenarios");
+                    console.log('scenarioId', scenarioId)
+                    const scenarioInfo = (await scenarios.findOne({ _id: new ObjectId(scenarioId) }))!
+                    console.log('scenario info', scenarioInfo)
+                    const { humeConfigId } = scenarioInfo
+                    rawSocket = new WebSocket(`wss://api.hume.ai/v0/evi/chat?api_key=${process.env.HUME_API_KEY}&config_id=${humeConfigId}`)
+                    rawSocket.onopen = () => {
+                        console.log('hume socket opened', humeConfigId)
+                    }
+
+                    rawSocket.onmessage = async (e) => {
+                        const parsed = JSON.parse(e.data as string)
+                        const audio = parsed.data
+                        if (typeof audio === "string") {
+                            const wav = Buffer.from(audio, "base64")
+                            const mp3 = await convertWavToMp3(wav)
+                            // fs.writeFileSync(parsed.id + ".mp3", mp3, "binary")
+                            queue.push([mp3, botId])
+                        } else {
+                            console.log('hume response', parsed)
+                        }
+                    }
+                }
+                
             } else if (queue.idle()) {
                 const s16le = data
                 buffers.push(s16le)
@@ -81,14 +97,12 @@ socketServer.on("connection", async (ws, request) => {
                     // fs.writeFileSync(`segment${writes}.raw`, concat, "binary")
                     const wav = await convertS16LEToWavBase64(concat)
                     // fs.writeFileSync(`segment${writes}.wav`, wav, "binary")
-                    rawSocket.send(JSON.stringify({
+                    rawSocket?.send(JSON.stringify({
                         data: wav.toString("base64"),
                         type: "audio_input"
                     }))
                     buffers = []
-                    writes += 1
                 }
-                // fs.writeFileSync("original.raw", Buffer.concat(buffers), "binary")
             } else {
                 console.log('pausing, waiting for queue', queue.length())
             }
@@ -181,4 +195,18 @@ async function getAudioDuration(buffer: Buffer): Promise<number> {
           }
         });
     });
-  }
+}
+
+function getFormattedPrompt(data: Record<string, any>) {
+    const description = `You are {name}. {name} is a {age}-year-old {occupation} who is currently feeling distressed and struggling with negative thoughts, particularly a sense of not belonging and worthlessness. Overwhelmed with both school and personal issues, {name}'s mental state has led to noticeable changes in behavior and routines.
+
+Previously an active participant in social activities, {name} now frequently withdraws from these interactions, often preferring to stay isolated. This withdrawal extends to their academic life, where they have stopped attending classes regularly, leading to a decline in academic performance.
+
+These feelings of distress and negative self-worth have also impacted {name}'s physical well-being. There have been significant changes in their sleep patterns, with {name} either sleeping too much or suffering from insomnia. Similarly, their eating habits have become irregular, sometimes eating very little and other times overeating.
+
+{name}'s once vibrant and engaged presence has dimmed, replaced by a person struggling to find a sense of purpose and belonging amid the overwhelming pressures of college and personal life.
+
+Here is a list of actions you've done recently: {actions}.
+`;
+    return description.format(data)
+}
